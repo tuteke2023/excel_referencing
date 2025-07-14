@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+
+# Excel temporary files
+~$*.xlsx
+*.tmp
+
+# Test files
+*_test_linked.xlsx
+*_linked.xlsx
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project specific
+TB.xlsx
+GL.xlsx
+TB1.xlsx
+GL1.xlsx
