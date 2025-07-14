@@ -6,13 +6,15 @@ Simple drag-and-drop interface for linking TB and GL files
 
 import streamlit as st
 import pandas as pd
-import io
 import tempfile
 import os
-import sys
-import openpyxl
-from openpyxl import load_workbook
-from openpyxl.utils import get_column_letter
+try:
+    import openpyxl
+    from openpyxl import load_workbook
+    from openpyxl.utils import get_column_letter
+except ImportError:
+    st.error("Missing required package: openpyxl. Please contact support.")
+    st.stop()
 from difflib import SequenceMatcher
 
 class TBGLLinkerWeb:
