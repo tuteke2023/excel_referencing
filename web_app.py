@@ -3,6 +3,8 @@
 Web-based TB-GL Linker (Net Movement Version) using Streamlit
 Links TB accounts to Net Movement figures instead of account headers.
 The hyperlink text displays the actual Net Movement value.
+
+Version: 1.1.0 (2026-01-27) - Dynamic hyperlinks with formula support
 """
 
 import streamlit as st
@@ -386,7 +388,8 @@ def main():
 
     st.title("📊 TB-GL Linker")
     st.markdown("**Link your Trial Balance to General Ledger Net Movement figures**")
-    st.info("Links to Net Movement cells and displays the actual value as the hyperlink text.")
+    st.info("Links to Net Movement cells and displays the actual value as the hyperlink text. Values update dynamically when GL is modified.")
+    st.caption("Version 1.1.0 - Dynamic hyperlinks with formula support")
 
     # Add demo info and GitHub link
     col1, col2, col3 = st.columns([2, 1, 1])
