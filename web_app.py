@@ -576,6 +576,14 @@ def main():
                             match_rate = len(linker.account_mappings) / len(results_data) * 100 if results_data else 0
                             st.metric("Match Rate", f"{match_rate:.1f}%")
 
+                        # Debug info - show sample hyperlinks
+                        with st.expander("🔍 Debug: Sample Hyperlinks (click to expand)"):
+                            st.write("First 5 matched accounts and their target cells:")
+                            for i, (tb_row, (gl_account, gl_info)) in enumerate(list(linker.account_mappings.items())[:5]):
+                                is_fallback = gl_info['target_cell'].startswith('A')
+                                status = "⚠️ FALLBACK" if is_fallback else "✅ NET MOVEMENT"
+                                st.write(f"{status}: {gl_account} → {gl_info['target_cell']} = {gl_info['value']}")
+
                     # Download button
                     with open(output_path, 'rb') as f:
                         st.download_button(
