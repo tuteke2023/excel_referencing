@@ -4,7 +4,7 @@ Web-based TB-GL Linker (Net Movement Version) using Streamlit
 Links TB accounts to Net Movement figures instead of account headers.
 The hyperlink text displays the actual Net Movement value.
 
-Version: 1.2.0 (2026-01-27) - Claude Code headless mode for intelligent structure detection
+Version: 1.2.1 (2026-01-27) - Added API connectivity check on startup
 """
 
 import streamlit as st
@@ -12,6 +12,7 @@ import pandas as pd
 import tempfile
 import os
 import logging
+import requests
 try:
     import openpyxl
     from openpyxl import load_workbook
@@ -28,6 +29,11 @@ try:
         os.environ["CLAUDE_API_URL"] = st.secrets["CLAUDE_API_URL"]
     if "CLAUDE_API_TOKEN" in st.secrets:
         os.environ["CLAUDE_API_TOKEN"] = st.secrets["CLAUDE_API_TOKEN"]
+    # Cloudflare Access service token (for protected APIs)
+    if "CF_ACCESS_CLIENT_ID" in st.secrets:
+        os.environ["CF_ACCESS_CLIENT_ID"] = st.secrets["CF_ACCESS_CLIENT_ID"]
+    if "CF_ACCESS_CLIENT_SECRET" in st.secrets:
+        os.environ["CF_ACCESS_CLIENT_SECRET"] = st.secrets["CF_ACCESS_CLIENT_SECRET"]
 except Exception:
     pass  # Secrets not available (local development)
 
@@ -41,6 +47,103 @@ except ImportError:
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+def check_claude_api_connection() -> dict:
+    """
+    Check if the Claude API is reachable and Claude is available.
+    Returns dict with 'connected', 'claude_available', and 'message' keys.
+    """
+    api_url = os.environ.get("CLAUDE_API_URL")
+    api_token = os.environ.get("CLAUDE_API_TOKEN")
+    cf_access_client_id = os.environ.get("CF_ACCESS_CLIENT_ID")
+    cf_access_client_secret = os.environ.get("CF_ACCESS_CLIENT_SECRET")
+
+    if not api_url:
+        return {
+            'connected': False,
+            'claude_available': False,
+            'message': "CLAUDE_API_URL not configured. Please set up Streamlit secrets."
+        }
+
+    try:
+        headers = {}
+        if api_token:
+            headers["X-API-Token"] = api_token
+
+        # Add Cloudflare Access service token headers if configured
+        if cf_access_client_id and cf_access_client_secret:
+            headers["CF-Access-Client-Id"] = cf_access_client_id
+            headers["CF-Access-Client-Secret"] = cf_access_client_secret
+
+        response = requests.get(f"{api_url}/health", headers=headers, timeout=15, allow_redirects=False)
+
+        # Check for Cloudflare Access redirect (302 or 303)
+        if response.status_code in [302, 303]:
+            location = response.headers.get('Location', '')
+            if 'cloudflareaccess.com' in location or 'access' in location.lower():
+                return {
+                    'connected': False,
+                    'claude_available': False,
+                    'message': f"API protected by Cloudflare Access. Please configure CF_ACCESS_CLIENT_ID and CF_ACCESS_CLIENT_SECRET service tokens."
+                }
+
+        # Check for Cloudflare Access HTML page (200 with login form)
+        if response.status_code == 200:
+            content_type = response.headers.get('Content-Type', '')
+            if 'text/html' in content_type:
+                if 'cloudflareaccess' in response.text.lower() or 'cloudflare access' in response.text.lower():
+                    return {
+                        'connected': False,
+                        'claude_available': False,
+                        'message': f"API protected by Cloudflare Access. Please configure CF_ACCESS_CLIENT_ID and CF_ACCESS_CLIENT_SECRET service tokens."
+                    }
+
+            # Try to parse JSON response
+            try:
+                data = response.json()
+                if data.get("claude_available"):
+                    return {
+                        'connected': True,
+                        'claude_available': True,
+                        'message': f"Connected to Claude API"
+                    }
+                else:
+                    return {
+                        'connected': True,
+                        'claude_available': False,
+                        'message': f"API reachable but Claude CLI not available on server"
+                    }
+            except ValueError:
+                return {
+                    'connected': False,
+                    'claude_available': False,
+                    'message': f"Invalid response from API (not JSON)"
+                }
+        else:
+            return {
+                'connected': False,
+                'claude_available': False,
+                'message': f"API returned status {response.status_code}"
+            }
+    except requests.exceptions.Timeout:
+        return {
+            'connected': False,
+            'claude_available': False,
+            'message': f"Connection timeout - API server not responding"
+        }
+    except requests.exceptions.ConnectionError as e:
+        return {
+            'connected': False,
+            'claude_available': False,
+            'message': f"Cannot connect to API server"
+        }
+    except Exception as e:
+        return {
+            'connected': False,
+            'claude_available': False,
+            'message': f"Connection error: {str(e)}"
+        }
 
 
 class TBGLLinkerWeb:
@@ -505,8 +608,40 @@ def main():
 
     st.title("📊 TB-GL Linker")
     st.markdown("**Link your Trial Balance to General Ledger Net Movement figures**")
+
+    # Check API connection on startup (cache in session state)
+    if 'api_status' not in st.session_state:
+        with st.spinner("Checking AI service connection..."):
+            st.session_state.api_status = check_claude_api_connection()
+
+    api_status = st.session_state.api_status
+
+    # Show connection status and block if not connected
+    if not api_status['connected'] or not api_status['claude_available']:
+        st.error(f"🚫 **Service Unavailable**: {api_status['message']}")
+        st.warning("""
+        The TB-GL Linker requires the AI analysis service to process your files.
+
+        **What this means:**
+        - The AI service is currently offline or unreachable
+        - File uploads are disabled until the service is restored
+
+        **What you can do:**
+        - Wait a few minutes and refresh the page
+        - Contact support if the issue persists
+        """)
+
+        # Add a retry button
+        if st.button("🔄 Retry Connection"):
+            del st.session_state.api_status
+            st.rerun()
+
+        st.stop()  # Stop execution - don't show the rest of the UI
+
+    # API is connected - show success indicator
+    st.success(f"✅ {api_status['message']}")
     st.info("Links to Net Movement cells and displays the actual value as the hyperlink text. Values update dynamically when GL is modified.")
-    st.caption("Version 1.2.0 - AI-powered structure detection for multi-software support")
+    st.caption("Version 1.2.1 - AI-powered structure detection for multi-software support")
 
     # Add demo info and GitHub link
     col1, col2, col3 = st.columns([2, 1, 1])
@@ -601,14 +736,8 @@ def main():
             )
 
         with col3:
-            use_ai = st.checkbox(
-                "🤖 Use AI Analysis",
-                value=CLAUDE_AVAILABLE,
-                disabled=not CLAUDE_AVAILABLE,
-                help="Use Claude AI to intelligently detect file structure. Supports various accounting software (QuickBooks, Sage, Xero, NetSuite, etc.)"
-            )
-            if not CLAUDE_AVAILABLE:
-                st.caption("AI not available - using keyword detection")
+            st.markdown("🤖 **AI Analysis**")
+            st.caption("Enabled - using Claude AI for intelligent structure detection")
 
         # Process button
         if st.button("🚀 Process Files", type="primary"):
@@ -634,13 +763,10 @@ def main():
                         status_text.text(msg)
 
                     # Process files
-                    if use_ai:
-                        status_text.text("🤖 Initializing AI-powered analysis...")
-                    else:
-                        status_text.text("🔍 Analyzing file structures...")
+                    status_text.text("🤖 Initializing AI-powered analysis...")
                     progress_bar.progress(10)
 
-                    linker = TBGLLinkerWeb(tb_path, gl_path, output_path, use_claude=use_ai, status_callback=update_status)
+                    linker = TBGLLinkerWeb(tb_path, gl_path, output_path, use_claude=True, status_callback=update_status)
 
                     status_text.text("📊 Loading workbooks...")
                     progress_bar.progress(25)

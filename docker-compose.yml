@@ -4,8 +4,8 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: tb-gl-linker
-    ports:
-      - "8530:8501"
+    # Use host network to easily access localhost services
+    network_mode: host
     volumes:
       # Mount Claude config for AI-powered analysis (optional)
       - ~/.claude:/root/.claude:ro
@@ -15,12 +15,15 @@ services:
       - ./excel_converter.py:/app/excel_converter.py:ro
       - ./prompt_templates.py:/app/prompt_templates.py:ro
     environment:
-      - STREAMLIT_SERVER_PORT=8501
-      - STREAMLIT_SERVER_ADDRESS=0.0.0.0
       - STREAMLIT_BROWSER_GATHER_USAGE_STATS=false
+      # Claude API configuration - use localhost since we're in host network mode
+      - CLAUDE_API_URL=http://localhost:8600
+      - CLAUDE_API_TOKEN=${CLAUDE_API_TOKEN:-}
+    # Override command to use port 8530 (avoid conflict with other Streamlit apps)
+    command: ["streamlit", "run", "web_app.py", "--server.port=8530", "--server.address=0.0.0.0"]
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:8530/_stcore/health"]
       interval: 30s
       timeout: 10s
       retries: 3

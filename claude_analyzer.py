@@ -47,6 +47,9 @@ class ClaudeAnalyzer:
         self._mode = None  # 'api', 'cli', or None
         self._api_url = os.getenv("CLAUDE_API_URL", "").strip()
         self._api_token = os.getenv("CLAUDE_API_TOKEN", "").strip()
+        # Cloudflare Access service token (for protected APIs)
+        self._cf_access_client_id = os.getenv("CF_ACCESS_CLIENT_ID", "").strip()
+        self._cf_access_client_secret = os.getenv("CF_ACCESS_CLIENT_SECRET", "").strip()
 
     def _detect_mode(self) -> Optional[str]:
         """Detect which mode to use."""
@@ -56,16 +59,25 @@ class ClaudeAnalyzer:
         # Check API mode first (preferred for cloud deployments)
         if self._api_url:
             try:
+                headers = self._get_api_headers()
                 response = requests.get(
                     f"{self._api_url}/health",
-                    timeout=10
+                    headers=headers,
+                    timeout=15,
+                    allow_redirects=False
                 )
                 if response.status_code == 200:
-                    data = response.json()
-                    if data.get("claude_available"):
-                        self._mode = "api"
-                        logger.info(f"Using Claude API mode: {self._api_url}")
-                        return self._mode
+                    # Check if it's actually JSON (not Cloudflare Access HTML)
+                    content_type = response.headers.get('Content-Type', '')
+                    if 'application/json' in content_type:
+                        data = response.json()
+                        if data.get("claude_available"):
+                            self._mode = "api"
+                            logger.info(f"Using Claude API mode: {self._api_url}")
+                            return self._mode
+                    elif 'text/html' in content_type:
+                        # Likely Cloudflare Access login page
+                        logger.warning("API returned HTML - likely Cloudflare Access protected")
             except Exception as e:
                 logger.warning(f"Claude API not available: {e}")
 
@@ -97,6 +109,10 @@ class ClaudeAnalyzer:
         headers = {"Content-Type": "application/json"}
         if self._api_token:
             headers["X-API-Token"] = self._api_token
+        # Add Cloudflare Access service token headers if configured
+        if self._cf_access_client_id and self._cf_access_client_secret:
+            headers["CF-Access-Client-Id"] = self._cf_access_client_id
+            headers["CF-Access-Client-Secret"] = self._cf_access_client_secret
         return headers
 
     def _run_claude_api(self, prompt: str) -> Optional[dict]:
