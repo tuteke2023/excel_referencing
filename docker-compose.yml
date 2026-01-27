@@ -1,0 +1,47 @@
+services:
+  tb-gl-linker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: tb-gl-linker
+    ports:
+      - "8530:8501"
+    volumes:
+      # Mount Claude config for AI-powered analysis (optional)
+      - ~/.claude:/root/.claude:ro
+      # Mount source files for live updates during development
+      - ./web_app.py:/app/web_app.py:ro
+      - ./claude_analyzer.py:/app/claude_analyzer.py:ro
+      - ./excel_converter.py:/app/excel_converter.py:ro
+      - ./prompt_templates.py:/app/prompt_templates.py:ro
+    environment:
+      - STREAMLIT_SERVER_PORT=8501
+      - STREAMLIT_SERVER_ADDRESS=0.0.0.0
+      - STREAMLIT_BROWSER_GATHER_USAGE_STATS=false
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # Development mode with hot reload
+  tb-gl-linker-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: tb-gl-linker-dev
+    ports:
+      - "8531:8501"
+    volumes:
+      # Mount all source files for live editing
+      - .:/app
+      - ~/.claude:/root/.claude:ro
+    environment:
+      - STREAMLIT_SERVER_PORT=8501
+      - STREAMLIT_SERVER_ADDRESS=0.0.0.0
+      - STREAMLIT_SERVER_RUN_ON_SAVE=true
+    profiles:
+      - dev
+    restart: unless-stopped

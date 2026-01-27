@@ -4,13 +4,14 @@ Web-based TB-GL Linker (Net Movement Version) using Streamlit
 Links TB accounts to Net Movement figures instead of account headers.
 The hyperlink text displays the actual Net Movement value.
 
-Version: 1.1.0 (2026-01-27) - Dynamic hyperlinks with formula support
+Version: 1.2.0 (2026-01-27) - Claude Code headless mode for intelligent structure detection
 """
 
 import streamlit as st
 import pandas as pd
 import tempfile
 import os
+import logging
 try:
     import openpyxl
     from openpyxl import load_workbook
@@ -21,11 +22,31 @@ except ImportError:
 from difflib import SequenceMatcher
 import re
 
+# Load Streamlit secrets into environment variables (for Streamlit Cloud)
+try:
+    if "CLAUDE_API_URL" in st.secrets:
+        os.environ["CLAUDE_API_URL"] = st.secrets["CLAUDE_API_URL"]
+    if "CLAUDE_API_TOKEN" in st.secrets:
+        os.environ["CLAUDE_API_TOKEN"] = st.secrets["CLAUDE_API_TOKEN"]
+except Exception:
+    pass  # Secrets not available (local development)
+
+# Import Claude analyzer (optional - graceful fallback if not available)
+try:
+    from claude_analyzer import ClaudeAnalyzerWithFallback
+    CLAUDE_AVAILABLE = True
+except ImportError:
+    CLAUDE_AVAILABLE = False
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 
 class TBGLLinkerWeb:
     """TB-GL Linker that links to Net Movement figures instead of account headers."""
 
-    def __init__(self, tb_path, gl_path, output_path):
+    def __init__(self, tb_path, gl_path, output_path, use_claude=True, status_callback=None):
         self.tb_file = tb_path
         self.gl_file = gl_path
         self.output_file = output_path
@@ -39,16 +60,56 @@ class TBGLLinkerWeb:
         self.gl_debit_col = None
         self.gl_credit_col = None
 
+        # Claude analyzer integration
+        self.use_claude = use_claude and CLAUDE_AVAILABLE
+        self.claude_analyzer = None
+        self.claude_used = False  # Track if Claude was actually used
+        self.status_callback = status_callback  # For UI status updates
+
+        if self.use_claude:
+            try:
+                self.claude_analyzer = ClaudeAnalyzerWithFallback(timeout=120)
+                if not self.claude_analyzer.should_use_claude():
+                    self.use_claude = False
+                    logger.info("Claude CLI not available, using fallback detection")
+            except Exception as e:
+                logger.warning(f"Failed to initialize Claude analyzer: {e}")
+                self.use_claude = False
+
+    def _update_status(self, message):
+        """Update status via callback if available."""
+        if self.status_callback:
+            self.status_callback(message)
+        logger.info(message)
+
     def load_workbooks(self):
         """Load both workbooks and identify the main sheets."""
         self.tb_wb = load_workbook(self.tb_file)
         self.gl_wb = load_workbook(self.gl_file, data_only=True)
 
-        # Find TB sheet (usually first sheet or one with 'TB' in name)
+        # Try Claude-powered sheet identification first
+        if self.use_claude and self.claude_analyzer:
+            try:
+                self._update_status("🤖 Using AI to identify sheet types...")
+                result = self.claude_analyzer.claude.identify_sheets(self.tb_wb, self.gl_wb)
+                if result and 'tb_sheet' in result and 'gl_sheet' in result:
+                    # Validate sheet names exist
+                    if result['tb_sheet'] in self.tb_wb.sheetnames and result['gl_sheet'] in self.gl_wb.sheetnames:
+                        self.tb_sheet = self.tb_wb[result['tb_sheet']]
+                        self.gl_sheet = self.gl_wb[result['gl_sheet']]
+                        self.claude_used = True
+                        logger.info(f"Claude identified sheets: TB='{result['tb_sheet']}', GL='{result['gl_sheet']}'")
+                        return
+                    else:
+                        logger.warning("Claude returned invalid sheet names, falling back")
+            except Exception as e:
+                logger.warning(f"Claude sheet identification failed: {e}")
+
+        # Fallback to keyword-based detection
+        self._update_status("🔍 Using keyword-based sheet detection...")
         tb_sheet_name = self._find_sheet(self.tb_wb, ['TB', 'Trial Balance', 'Trial_Balance'])
         self.tb_sheet = self.tb_wb[tb_sheet_name]
 
-        # Find GL sheet
         gl_sheet_name = self._find_sheet(self.gl_wb, ['GL', 'General Ledger', 'General_Ledger'])
         self.gl_sheet = self.gl_wb[gl_sheet_name]
 
@@ -67,6 +128,33 @@ class TBGLLinkerWeb:
 
     def analyze_tb_structure(self):
         """Analyze TB structure to find account columns."""
+        # Try Claude-powered analysis first
+        if self.use_claude and self.claude_analyzer:
+            try:
+                self._update_status("🤖 Using AI to analyze Trial Balance structure...")
+                result = self.claude_analyzer.claude.analyze_tb_structure(self.tb_sheet)
+                if result and all(k in result for k in ['header_row', 'debit_col', 'credit_col']):
+                    self.tb_config = {
+                        'header_row': result['header_row'],
+                        'account_col': result.get('account_col'),
+                        'account_name_col': result.get('account_name_col'),
+                        'debit_col': result['debit_col'],
+                        'credit_col': result['credit_col'],
+                        'data_start_row': result.get('data_start_row', result['header_row'] + 1)
+                    }
+                    self.claude_used = True
+                    software = result.get('software_detected', 'Unknown')
+                    logger.info(f"Claude analyzed TB structure (detected: {software}): {self.tb_config}")
+                    return
+            except Exception as e:
+                logger.warning(f"Claude TB analysis failed: {e}")
+
+        # Fallback to keyword-based detection
+        self._update_status("🔍 Using keyword-based TB structure detection...")
+        self._analyze_tb_structure_fallback()
+
+    def _analyze_tb_structure_fallback(self):
+        """Fallback TB structure analysis using keyword matching."""
         # Find header row (usually contains 'Account', 'Debit', 'Credit')
         header_row = None
         account_col = None
@@ -114,6 +202,29 @@ class TBGLLinkerWeb:
         if self.gl_debit_col and self.gl_credit_col:
             return self.gl_debit_col, self.gl_credit_col
 
+        # Try Claude-powered GL structure analysis (only once)
+        if self.use_claude and self.claude_analyzer and not hasattr(self, '_gl_structure_analyzed'):
+            try:
+                self._update_status("🤖 Using AI to analyze General Ledger structure...")
+                result = self.claude_analyzer.claude.analyze_gl_structure(self.gl_sheet)
+                if result and 'debit_col' in result and 'credit_col' in result:
+                    self.gl_debit_col = result['debit_col']
+                    self.gl_credit_col = result['credit_col']
+                    self._gl_summary_texts = result.get('summary_row_text', ['net movement'])
+                    self._gl_structure_analyzed = True
+                    self.claude_used = True
+                    software = result.get('software_detected', 'Unknown')
+                    logger.info(f"Claude analyzed GL structure (detected: {software}): debit={self.gl_debit_col}, credit={self.gl_credit_col}")
+                    return self.gl_debit_col, self.gl_credit_col
+            except Exception as e:
+                logger.warning(f"Claude GL structure analysis failed: {e}")
+            self._gl_structure_analyzed = True  # Don't retry
+
+        # Fallback to keyword-based detection
+        return self._find_gl_debit_credit_cols_fallback(near_row)
+
+    def _find_gl_debit_credit_cols_fallback(self, near_row=None):
+        """Fallback GL debit/credit column detection using keywords."""
         debit_col = None
         credit_col = None
 
@@ -180,26 +291,32 @@ class TBGLLinkerWeb:
         """
         debit_col, credit_col = self._find_gl_debit_credit_cols(header_row)
 
+        # Get summary text patterns (from Claude analysis or defaults)
+        summary_texts = getattr(self, '_gl_summary_texts', ['net movement', 'balance', 'total', 'movement'])
+
         # Determine search limit (stop at next account or reasonable limit)
         max_search = next_account_row if next_account_row else header_row + 500
         max_search = min(max_search, self.gl_sheet.max_row + 1)
 
         for row in range(header_row + 1, max_search):
-            # Check first few columns for "Net Movement" text
+            # Check first few columns for summary text
             for col in range(1, min(5, self.gl_sheet.max_column + 1)):
                 cell_value = self.gl_sheet.cell(row, col).value
                 if cell_value and isinstance(cell_value, str):
-                    if 'net movement' in cell_value.lower():
-                        # Found Net Movement row - get the non-zero column
-                        target_col, value = self._get_nonzero_column(row, debit_col, credit_col)
-                        target_cell = f"{get_column_letter(target_col)}{row}"
+                    cell_lower = cell_value.lower()
+                    # Check against all known summary text patterns
+                    for summary_text in summary_texts:
+                        if summary_text.lower() in cell_lower:
+                            # Found summary row - get the non-zero column
+                            target_col, value = self._get_nonzero_column(row, debit_col, credit_col)
+                            target_cell = f"{get_column_letter(target_col)}{row}"
 
-                        return {
-                            'net_movement_row': row,
-                            'net_movement_col': target_col,
-                            'target_cell': target_cell,
-                            'value': value
-                        }
+                            return {
+                                'net_movement_row': row,
+                                'net_movement_col': target_col,
+                                'target_cell': target_cell,
+                                'value': value
+                            }
 
         return None
 
@@ -389,8 +506,7 @@ def main():
     st.title("📊 TB-GL Linker")
     st.markdown("**Link your Trial Balance to General Ledger Net Movement figures**")
     st.info("Links to Net Movement cells and displays the actual value as the hyperlink text. Values update dynamically when GL is modified.")
-    st.caption("Version 1.1.1 - DEPLOYMENT TEST 27-JAN-2026 14:30")
-    st.warning("⚠️ If you see this message, the deployment is working correctly!")
+    st.caption("Version 1.2.0 - AI-powered structure detection for multi-software support")
 
     # Add demo info and GitHub link
     col1, col2, col3 = st.columns([2, 1, 1])
@@ -407,6 +523,11 @@ def main():
         - Displays the actual Net Movement value (e.g., `5,289`)
         - Automatically detects Debit/Credit columns
         - Uses whichever column has the non-zero value
+
+        **🤖 AI-Powered Analysis (v1.2+):**
+        - Intelligently detects file structure from various accounting software
+        - Supports QuickBooks, Sage, Xero, NetSuite, and other exports
+        - Falls back to keyword detection if AI is unavailable
         """)
 
     # Sample files info
@@ -462,7 +583,7 @@ def main():
     if tb_file and gl_file:
         st.subheader("🔧 Processing Options")
 
-        col1, col2 = st.columns(2)
+        col1, col2, col3 = st.columns(3)
         with col1:
             similarity_threshold = st.slider(
                 "Account Matching Similarity (%)",
@@ -478,6 +599,16 @@ def main():
                 value="TB_GL_Linked.xlsx",
                 help="Name for the output file"
             )
+
+        with col3:
+            use_ai = st.checkbox(
+                "🤖 Use AI Analysis",
+                value=CLAUDE_AVAILABLE,
+                disabled=not CLAUDE_AVAILABLE,
+                help="Use Claude AI to intelligently detect file structure. Supports various accounting software (QuickBooks, Sage, Xero, NetSuite, etc.)"
+            )
+            if not CLAUDE_AVAILABLE:
+                st.caption("AI not available - using keyword detection")
 
         # Process button
         if st.button("🚀 Process Files", type="primary"):
@@ -498,11 +629,18 @@ def main():
                     progress_bar = st.progress(0)
                     status_text = st.empty()
 
+                    # Status callback for real-time updates
+                    def update_status(msg):
+                        status_text.text(msg)
+
                     # Process files
-                    status_text.text("🔍 Analyzing file structures...")
+                    if use_ai:
+                        status_text.text("🤖 Initializing AI-powered analysis...")
+                    else:
+                        status_text.text("🔍 Analyzing file structures...")
                     progress_bar.progress(10)
 
-                    linker = TBGLLinkerWeb(tb_path, gl_path, output_path)
+                    linker = TBGLLinkerWeb(tb_path, gl_path, output_path, use_claude=use_ai, status_callback=update_status)
 
                     status_text.text("📊 Loading workbooks...")
                     progress_bar.progress(25)
@@ -527,10 +665,14 @@ def main():
                     linker.save_workbook()
 
                     progress_bar.progress(100)
-                    status_text.text("✅ Processing complete!")
+                    if linker.claude_used:
+                        status_text.text("✅ Processing complete! (AI-powered analysis used)")
+                    else:
+                        status_text.text("✅ Processing complete! (keyword-based detection used)")
 
                     # Display results
-                    st.success(f"✅ Successfully processed! {len(linker.account_mappings)} accounts linked to Net Movement figures.")
+                    analysis_mode = "AI-powered" if linker.claude_used else "keyword-based"
+                    st.success(f"✅ Successfully processed! {len(linker.account_mappings)} accounts linked to Net Movement figures. (Analysis: {analysis_mode})")
 
                     # Show matching results
                     if linker.account_mappings:
@@ -579,7 +721,8 @@ def main():
 
                         # Debug info - show sample hyperlinks
                         with st.expander("🔍 Debug: Sample Hyperlinks (click to expand)"):
-                            st.write("First 5 matched accounts and their target cells:")
+                            st.write(f"**Analysis method:** {'🤖 AI-powered (Claude)' if linker.claude_used else '🔍 Keyword-based (fallback)'}")
+                            st.write("**First 5 matched accounts and their target cells:**")
                             for i, (tb_row, (gl_account, gl_info)) in enumerate(list(linker.account_mappings.items())[:5]):
                                 is_fallback = gl_info['target_cell'].startswith('A')
                                 status = "⚠️ FALLBACK" if is_fallback else "✅ NET MOVEMENT"
