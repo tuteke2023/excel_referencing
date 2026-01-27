@@ -40,7 +40,7 @@ class TBGLLinkerWeb:
     def load_workbooks(self):
         """Load both workbooks and identify the main sheets."""
         self.tb_wb = load_workbook(self.tb_file)
-        self.gl_wb = load_workbook(self.gl_file)
+        self.gl_wb = load_workbook(self.gl_file, data_only=True)
 
         # Find TB sheet (usually first sheet or one with 'TB' in name)
         tb_sheet_name = self._find_sheet(self.tb_wb, ['TB', 'Trial Balance', 'Trial_Balance'])
@@ -361,8 +361,8 @@ class TBGLLinkerWeb:
             else:
                 display_value = "0"
 
-            # Create hyperlink formula with value as display text
-            formula = f'=HYPERLINK("#\'General Ledger Detail\'!{target_cell}", "{display_value}")'
+            # Create hyperlink formula with dynamic cell reference as display text
+            formula = f"=HYPERLINK(\"#'General Ledger Detail'!{target_cell}\", 'General Ledger Detail'!{target_cell})"
             cell.value = formula
 
         # Add "N/A" for unmatched accounts
