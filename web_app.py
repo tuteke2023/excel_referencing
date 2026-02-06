@@ -51,19 +51,38 @@ logger = logging.getLogger(__name__)
 
 def check_claude_api_connection() -> dict:
     """
-    Check if the Claude API is reachable and Claude is available.
+    Check if Claude is available via API or CLI.
     Returns dict with 'connected', 'claude_available', and 'message' keys.
     """
+    import subprocess
+    
     api_url = os.environ.get("CLAUDE_API_URL")
     api_token = os.environ.get("CLAUDE_API_TOKEN")
     cf_access_client_id = os.environ.get("CF_ACCESS_CLIENT_ID")
     cf_access_client_secret = os.environ.get("CF_ACCESS_CLIENT_SECRET")
+    
+    # First, check if CLI mode is available (preferred for local deployments)
+    try:
+        result = subprocess.run(
+            ["claude", "--version"],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        if result.returncode == 0:
+            return {
+                'connected': True,
+                'claude_available': True,
+                'message': f"Claude CLI available: {result.stdout.strip()}"
+            }
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        pass
 
     if not api_url:
         return {
             'connected': False,
             'claude_available': False,
-            'message': "CLAUDE_API_URL not configured. Please set up Streamlit secrets."
+            'message': "Neither Claude CLI nor CLAUDE_API_URL configured."
         }
 
     try:
@@ -274,11 +293,24 @@ class TBGLLinkerWeb:
 
             # Look for key headers
             for col, value in row_values:
-                if any(keyword in value for keyword in ['account', 'acct', 'code']):
-                    if 'name' in value or 'description' in value:
+                # Skip "Account Type" - it's not an account column
+                if 'type' in value:
+                    continue
+                    
+                if any(keyword in value for keyword in ['account', 'acct']):
+                    if 'code' in value or 'number' in value or 'no' in value:
+                        # Account Code/Number column
+                        if not account_col:
+                            account_col = col
+                    elif 'name' in value or 'description' in value:
+                        # Account Name column
                         account_name_col = col
                     else:
-                        account_col = col
+                        # Just "Account" - use as name if not set, or code if name is set
+                        if not account_name_col:
+                            account_name_col = col
+                        elif not account_col:
+                            account_col = col
                     header_row = row
                 elif 'debit' in value:
                     debit_col = col
@@ -395,12 +427,28 @@ class TBGLLinkerWeb:
         debit_col, credit_col = self._find_gl_debit_credit_cols(header_row)
 
         # Get summary text patterns (from Claude analysis or defaults)
-        summary_texts = getattr(self, '_gl_summary_texts', ['net movement', 'balance', 'total', 'movement'])
+        # Be specific to avoid matching transaction descriptions like "Opening Balance"
+        summary_texts = getattr(self, '_gl_summary_texts', [
+            'net movement', 'closing balance', 'period total', 'ytd total',
+            'year to date', 'ending balance', 'net change', 'account total'
+        ])
+        
+        # Filter out overly generic patterns that would match "Total [Name]" rows
+        # We want "Net movement" not "Total Bank Fees"
+        summary_texts = [t for t in summary_texts if t.lower() not in ['total', 'balance', 'net']]
+        
+        # Ensure 'net movement' is always first (highest priority)
+        if 'net movement' not in [t.lower() for t in summary_texts]:
+            summary_texts.insert(0, 'net movement')
 
         # Determine search limit (stop at next account or reasonable limit)
         max_search = next_account_row if next_account_row else header_row + 500
         max_search = min(max_search, self.gl_sheet.max_row + 1)
 
+        last_value_row = None
+        last_value_col = None
+        last_value = None
+        
         for row in range(header_row + 1, max_search):
             # Check first few columns for summary text
             for col in range(1, min(5, self.gl_sheet.max_column + 1)):
@@ -420,12 +468,36 @@ class TBGLLinkerWeb:
                                 'target_cell': target_cell,
                                 'value': value
                             }
+            
+            # Track the last row with a numeric value in debit/credit columns
+            # This serves as a fallback if no summary text is found
+            target_col, value = self._get_nonzero_column(row, debit_col, credit_col)
+            if value != 0:
+                last_value_row = row
+                last_value_col = target_col
+                last_value = value
+
+        # Fallback: if no summary text found but we have a row with values,
+        # use the last such row (often the summary/total row)
+        if last_value_row:
+            target_cell = f"{get_column_letter(last_value_col)}{last_value_row}"
+            return {
+                'net_movement_row': last_value_row,
+                'net_movement_col': last_value_col,
+                'target_cell': target_cell,
+                'value': last_value
+            }
 
         return None
 
     def _is_account_header(self, row, value):
         """Determine if a cell contains an account header."""
         if row >= self.gl_sheet.max_row:
+            return False
+        
+        # Exclude "Total [Name]" and "Net movement" rows - these are summaries, not headers
+        value_lower = value.lower() if isinstance(value, str) else ''
+        if value_lower.startswith('total ') or value_lower == 'net movement':
             return False
 
         # Account headers usually don't have dates or numbers in the same row
@@ -555,36 +627,27 @@ class TBGLLinkerWeb:
                 new_cell = new_sheet.cell(row=cell.row, column=cell.column, value=cell.value)
 
     def add_hyperlinks(self):
-        """Add hyperlinks to TB sheet pointing to Net Movement cells."""
-        # Find the best column for hyperlinks (after Credit or last column)
+        """Add direct cell references to TB sheet pointing to Net Movement cells."""
+        # Find the best column for references (after Credit or last column)
         if self.tb_config['credit_col']:
-            hyperlink_col = self.tb_config['credit_col'] + 1
+            ref_col = self.tb_config['credit_col'] + 1
         elif self.tb_config['debit_col']:
-            hyperlink_col = self.tb_config['debit_col'] + 1
+            ref_col = self.tb_config['debit_col'] + 1
         else:
-            hyperlink_col = self.tb_sheet.max_column + 1
+            ref_col = self.tb_sheet.max_column + 1
 
-        # Add header - changed to "GL Reference"
-        self.tb_sheet.cell(self.tb_config['header_row'], hyperlink_col, 'GL Reference')
+        # Add header
+        self.tb_sheet.cell(self.tb_config['header_row'], ref_col, 'GL Net Movement')
 
-        # Add hyperlinks for matched accounts
+        # Add direct cell references for matched accounts
+        # Using direct references instead of HYPERLINK so row numbers adjust
+        # automatically when rows are inserted/deleted in the GL sheet
         for tb_row, (gl_account, gl_info) in self.account_mappings.items():
-            cell = self.tb_sheet.cell(tb_row, hyperlink_col)
+            cell = self.tb_sheet.cell(tb_row, ref_col)
             target_cell = gl_info['target_cell']
-            value = gl_info['value']
-
-            # Format the value for display
-            if value is not None and value != 0:
-                # Format number with commas, no decimal if whole number
-                if isinstance(value, float) and value == int(value):
-                    display_value = f"{int(value):,}"
-                else:
-                    display_value = f"{value:,.2f}" if isinstance(value, float) else str(value)
-            else:
-                display_value = "0"
-
-            # Create hyperlink formula with dynamic cell reference as display text
-            formula = f"=HYPERLINK(\"#'General Ledger Detail'!{target_cell}\", 'General Ledger Detail'!{target_cell})"
+            
+            # Direct cell reference formula - will auto-adjust when rows inserted/deleted
+            formula = f"='General Ledger Detail'!{target_cell}"
             cell.value = formula
 
         # Add "N/A" for unmatched accounts
@@ -592,7 +655,7 @@ class TBGLLinkerWeb:
             if row not in self.account_mappings:
                 account_name = self.tb_sheet.cell(row, self.tb_config.get('account_name_col', 2)).value
                 if account_name:
-                    self.tb_sheet.cell(row, hyperlink_col, 'N/A')
+                    self.tb_sheet.cell(row, ref_col, 'N/A')
 
     def save_workbook(self):
         """Save the modified workbook."""

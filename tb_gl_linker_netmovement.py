@@ -80,11 +80,24 @@ class TBGLLinkerNetMovement:
 
             # Look for key headers
             for col, value in row_values:
-                if any(keyword in value for keyword in ['account', 'acct', 'code']):
-                    if 'name' in value or 'description' in value:
+                # Skip "Account Type" - it's not an account column
+                if 'type' in value:
+                    continue
+                    
+                if any(keyword in value for keyword in ['account', 'acct']):
+                    if 'code' in value or 'number' in value or 'no' in value:
+                        # Account Code/Number column
+                        if not account_col:
+                            account_col = col
+                    elif 'name' in value or 'description' in value:
+                        # Account Name column
                         account_name_col = col
                     else:
-                        account_col = col
+                        # Just "Account" - use as name if not set, or code if name is set
+                        if not account_name_col:
+                            account_name_col = col
+                        elif not account_col:
+                            account_col = col
                     header_row = row
                 elif 'debit' in value:
                     debit_col = col
@@ -189,22 +202,59 @@ class TBGLLinkerNetMovement:
         max_search = next_account_row if next_account_row else header_row + 500
         max_search = min(max_search, self.gl_sheet.max_row + 1)
 
+        # Summary text patterns - be specific to avoid matching "Opening Balance" etc.
+        summary_texts = [
+            'net movement', 'closing balance', 'period total', 'ytd total',
+            'year to date', 'ending balance', 'net change', 'account total'
+        ]
+        
+        # Filter out overly generic patterns that would match "Total [Name]" rows
+        summary_texts = [t for t in summary_texts if t.lower() not in ['total', 'balance', 'net']]
+        
+        # Ensure 'net movement' is always first (highest priority)
+        if 'net movement' not in [t.lower() for t in summary_texts]:
+            summary_texts.insert(0, 'net movement')
+        
+        last_value_row = None
+        last_value_col = None
+        last_value = None
+        
         for row in range(header_row + 1, max_search):
-            # Check first few columns for "Net Movement" text
+            # Check first few columns for summary text
             for col in range(1, min(5, self.gl_sheet.max_column + 1)):
                 cell_value = self.gl_sheet.cell(row, col).value
                 if cell_value and isinstance(cell_value, str):
-                    if 'net movement' in cell_value.lower():
-                        # Found Net Movement row - get the non-zero column
-                        target_col, value = self._get_nonzero_column(row, debit_col, credit_col)
-                        target_cell = f"{get_column_letter(target_col)}{row}"
+                    cell_lower = cell_value.lower()
+                    # Check against all known summary text patterns
+                    for summary_text in summary_texts:
+                        if summary_text in cell_lower:
+                            # Found summary row - get the non-zero column
+                            target_col, value = self._get_nonzero_column(row, debit_col, credit_col)
+                            target_cell = f"{get_column_letter(target_col)}{row}"
 
-                        return {
-                            'net_movement_row': row,
-                            'net_movement_col': target_col,
-                            'target_cell': target_cell,
-                            'value': value
-                        }
+                            return {
+                                'net_movement_row': row,
+                                'net_movement_col': target_col,
+                                'target_cell': target_cell,
+                                'value': value
+                            }
+            
+            # Track the last row with a numeric value in debit/credit columns
+            target_col, value = self._get_nonzero_column(row, debit_col, credit_col)
+            if value != 0:
+                last_value_row = row
+                last_value_col = target_col
+                last_value = value
+
+        # Fallback: use the last row with values if no summary text found
+        if last_value_row:
+            target_cell = f"{get_column_letter(last_value_col)}{last_value_row}"
+            return {
+                'net_movement_row': last_value_row,
+                'net_movement_col': last_value_col,
+                'target_cell': target_cell,
+                'value': last_value
+            }
 
         return None
 
@@ -212,6 +262,11 @@ class TBGLLinkerNetMovement:
         """Determine if a cell contains an account header."""
         # Check if next rows have date/transaction data
         if row >= self.gl_sheet.max_row:
+            return False
+        
+        # Exclude "Total [Name]" and "Net movement" rows - these are summaries, not headers
+        value_lower = value.lower() if isinstance(value, str) else ''
+        if value_lower.startswith('total ') or value_lower == 'net movement':
             return False
 
         # Account headers usually don't have dates or numbers in the same row
@@ -302,7 +357,14 @@ class TBGLLinkerNetMovement:
             if self.tb_config['account_name_col']:
                 account_name = self.tb_sheet.cell(row, self.tb_config['account_name_col']).value
 
-            # If no name column or empty, try to find account name in other columns
+            # If no name column or empty, try account code column (may contain combined code + name)
+            if not account_name and self.tb_config['account_col']:
+                cell_value = self.tb_sheet.cell(row, self.tb_config['account_col']).value
+                if cell_value and isinstance(cell_value, str) and len(cell_value) > 3:
+                    # Use this as account name (handles "090 - Petty Cash" format)
+                    account_name = cell_value
+
+            # If still no name, try to find account name in other columns
             if not account_name:
                 # Check columns near the account code column for account names
                 for col_offset in [1, -1, 2, -2]:  # Check adjacent columns
@@ -396,46 +458,40 @@ class TBGLLinkerNetMovement:
         print("GL sheet copied successfully!")
 
     def add_hyperlinks(self):
-        """Add hyperlinks to TB sheet pointing to Net Movement cells."""
-        print("\nAdding hyperlinks to Trial Balance (Net Movement version)...")
+        """Add direct cell references to TB sheet pointing to Net Movement cells."""
+        print("\nAdding cell references to Trial Balance (Net Movement version)...")
 
-        # Find the best column for hyperlinks (after Credit or last column)
+        # Find the best column for references (after Credit or last column)
         if self.tb_config['credit_col']:
-            hyperlink_col = self.tb_config['credit_col'] + 1
+            ref_col = self.tb_config['credit_col'] + 1
         elif self.tb_config['debit_col']:
-            hyperlink_col = self.tb_config['debit_col'] + 1
+            ref_col = self.tb_config['debit_col'] + 1
         else:
-            hyperlink_col = self.tb_sheet.max_column + 1
+            ref_col = self.tb_sheet.max_column + 1
 
-        # Add header - changed to "GL Reference"
-        self.tb_sheet.cell(self.tb_config['header_row'], hyperlink_col, 'GL Reference')
+        # Add header
+        self.tb_sheet.cell(self.tb_config['header_row'], ref_col, 'GL Net Movement')
 
-        # Add hyperlinks for matched accounts
+        # Add direct cell references for matched accounts
+        # Using direct references instead of HYPERLINK so row numbers adjust
+        # automatically when rows are inserted/deleted in the GL sheet
         for tb_row, (gl_account, gl_info) in self.account_mappings.items():
-            cell = self.tb_sheet.cell(tb_row, hyperlink_col)
+            cell = self.tb_sheet.cell(tb_row, ref_col)
             target_cell = gl_info['target_cell']
-            value = gl_info['value']
-
-            # Format the value for display
-            if value is not None and value != 0:
-                # Format number with commas, no decimal if whole number
-                if isinstance(value, float) and value == int(value):
-                    display_value = f"{int(value):,}"
-                else:
-                    display_value = f"{value:,.2f}" if isinstance(value, float) else str(value)
-            else:
-                display_value = "0"
-
-            # Create hyperlink formula with dynamic cell reference as display text
-            formula = f"=HYPERLINK(\"#'General Ledger Detail'!{target_cell}\", 'General Ledger Detail'!{target_cell})"
+            
+            # Direct cell reference formula - will auto-adjust when rows inserted/deleted
+            formula = f"='General Ledger Detail'!{target_cell}"
             cell.value = formula
 
         # Add "N/A" for unmatched accounts
         for row in range(self.tb_config['data_start_row'], self.tb_sheet.max_row + 1):
             if row not in self.account_mappings:
-                account_name = self.tb_sheet.cell(row, self.tb_config['account_name_col']).value
-                if account_name:
-                    self.tb_sheet.cell(row, hyperlink_col, 'N/A')
+                # Get account name from name column or account code column
+                name_col = self.tb_config['account_name_col'] or self.tb_config['account_col']
+                if name_col:
+                    account_name = self.tb_sheet.cell(row, name_col).value
+                    if account_name:
+                        self.tb_sheet.cell(row, hyperlink_col, 'N/A')
 
         print(f"Hyperlinks added in column {get_column_letter(hyperlink_col)}")
 
